@@ -4,7 +4,7 @@
 
 This repository is the core server (`stdio` transport) allowing AI models like Claude to instantly observe their host operating environment.
 
-## 🚀 Getting Started (for Contributors)
+## Getting Started (for Contributors)
 
 ### 1. Prerequisites
 
@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-## 🛠️ Testing with an AI Client
+## Testing with an AI Client
 
 Because `cortexd` speaks the Model Context Protocol natively over `stdin/stdout`, you can instantly test it with any MCP-compliant interface.
 
@@ -63,7 +63,7 @@ To hook the daemon directly into Claude Desktop on your Linux host:
 
 3. Restart Claude Desktop. It will now have the ability to observe your system in real-time.
 
-## 🏗️ Architecture
+## Architecture
 
 The project intentionally uses a single-crate MVP structure for maximum DevX loop velocity:
 
