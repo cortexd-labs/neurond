@@ -22,7 +22,7 @@ This repository is the core server (`stdio` transport) allowing AI models like C
 
 ```bash
 # Clone the repository
-git clone https://github.com/neurond-labs/neurond.git
+git clone https://github.com/cortexd-labs/neurond.git
 cd neurond
 
 # Run the test suite mappings against the raw Linux kernel endpoints
