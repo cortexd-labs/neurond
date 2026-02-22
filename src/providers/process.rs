@@ -1,4 +1,4 @@
-use crate::core::provider::{Provider, ProviderError, Result, Tool, ToolType};
+use crate::engine::provider::{Provider, ProviderError, Result, Tool, ToolType};
 use serde_json::Value;
 
 pub struct ProcessProvider;
@@ -45,7 +45,7 @@ impl Provider for ProcessProvider {
         match tool {
             "process.list" => crate::linux::procfs::get_process_list(),
             "process.top" => {
-                let sort_by = params.get("sort_by").and_then(|s| s.as_str()).unwrap_or("cpu");
+                let sort_by = params.get("sort_by").and_then(|s| s.as_str()).unwrap_or("memory");
                 let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
                 
                 let mut procs = crate::linux::procfs::get_process_list_vec()?;

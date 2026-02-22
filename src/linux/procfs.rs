@@ -1,4 +1,4 @@
-use crate::core::provider::{ProviderError, Result};
+use crate::engine::provider::{ProviderError, Result};
 use serde_json::Value;
 use std::fs;
 
@@ -78,8 +78,38 @@ pub fn get_system_memory() -> Result<Value> {
 }
 
 pub fn get_system_disk() -> Result<Value> {
-    // Stubbed. Complete implementation requires iterating /proc/mounts and statvfs
-    Ok(serde_json::json!([]))
+    let mounts = read_proc_file("/proc/mounts")?;
+    
+    let mut disks = Vec::new();
+    
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 { continue; }
+        
+        let device = parts[0];
+        let mount_point = parts[1];
+        let fs_type = parts[2];
+        
+        // Filter out pseudo-filesystems (only track actual block devices/ZFS/btrfs)
+        if device.starts_with("/dev/") || fs_type == "zfs" || fs_type == "btrfs" {
+            if let Ok(stat) = nix::sys::statvfs::statvfs(mount_point) {
+                let total_bytes = stat.blocks().saturating_mul(stat.fragment_size());
+                let free_bytes = stat.blocks_available().saturating_mul(stat.fragment_size());
+                let used_bytes = total_bytes.saturating_sub(free_bytes);
+                
+                disks.push(serde_json::json!({
+                    "device": device,
+                    "mount_point": mount_point,
+                    "fs_type": fs_type,
+                    "total_gb": total_bytes / 1_073_741_824,
+                    "used_gb": used_bytes / 1_073_741_824,
+                    "free_gb": free_bytes / 1_073_741_824,
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!(disks))
 }
 
 pub fn get_system_uptime() -> Result<Value> {
@@ -121,6 +151,7 @@ pub fn get_process_list_vec() -> Result<Vec<serde_json::Map<String, Value>>> {
 
             // Basic parsing of /proc/[pid]/status
             let status_path = format!("/proc/{}/status", pid);
+            let mut uid = "unknown".to_string();
             if let Ok(status) = fs::read_to_string(&status_path) {
                 for line in status.lines() {
                     if line.starts_with("Name:\t") {
@@ -132,6 +163,11 @@ pub fn get_process_list_vec() -> Result<Vec<serde_json::Map<String, Value>>> {
                     } else if line.starts_with("VmRSS:\t") {
                         let kb = parse_kb(line);
                         proc_obj.insert("mem_mb".into(), serde_json::json!((kb as f64) / 1024.0));
+                    } else if line.starts_with("Uid:\t") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() > 1 {
+                            uid = parts[1].to_string();
+                        }
                     }
                 }
             }
@@ -150,7 +186,7 @@ pub fn get_process_list_vec() -> Result<Vec<serde_json::Map<String, Value>>> {
             
             // Just defaults for CPU until full parsing implemented
             proc_obj.insert("cpu_percent".into(), serde_json::json!(0.0));
-            proc_obj.insert("user".into(), serde_json::json!("unknown"));
+            proc_obj.insert("user".into(), serde_json::json!(uid));
 
             procs.push(proc_obj);
         }

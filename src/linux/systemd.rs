@@ -1,10 +1,12 @@
-use crate::core::provider::{ProviderError, Result};
+use crate::engine::provider::{ProviderError, Result};
 use serde_json::Value;
 use std::process::Command;
 
 // zbus D-Bus interaction isn't strictly synchronously trivial.
 // We'll wrap a `block_on` or simply use a subprocess for the MVP, 
-// since the spec mandates sync `call` functions and rust `zbus` is highly async.
+// since the spec doesn't strictly mandate async right now.
+// TECH DEBT: `systemctl` and `journalctl` shell execution is an MVP shortcut.
+// This should be migrated to direct kernel API bindings or `zbus` D-Bus calls in the future.
 // As this is a 10-day MVP, invoking `systemctl` is an acceptable stand-in 
 // until zbus async boundaries are fully established across the `Provider` trait.
 
@@ -125,7 +127,7 @@ pub fn journal_search(keyword: &str, since: Option<&str>, priority: Option<&str>
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

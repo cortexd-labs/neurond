@@ -1,4 +1,4 @@
-use crate::core::provider::{Provider, Result, Tool};
+use crate::engine::provider::{Provider, Result, Tool};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -38,7 +38,7 @@ impl ProviderRegistry {
         // Find the provider that matches the namespace prefix
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         if parts.len() != 2 {
-            use crate::core::provider::ProviderError;
+            use crate::engine::provider::ProviderError;
             return Err(ProviderError::NotFound(name.to_string()));
         }
 
@@ -47,7 +47,7 @@ impl ProviderRegistry {
         if let Some(provider) = self.providers.get(namespace) {
             provider.call(name, params)
         } else {
-            use crate::core::provider::ProviderError;
+            use crate::engine::provider::ProviderError;
             Err(ProviderError::NotFound(name.to_string()))
         }
     }
@@ -56,7 +56,7 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::provider::{ToolType, ProviderError};
+    use crate::engine::provider::{ToolType, ProviderError};
 
     struct MockSystemProvider;
 

@@ -1,4 +1,4 @@
-use crate::core::provider::{Provider, ProviderError, Result, Tool, ToolType};
+use crate::engine::provider::{Provider, ProviderError, Result, Tool, ToolType};
 use serde_json::Value;
 
 pub struct ServiceProvider;
@@ -69,11 +69,7 @@ impl Provider for ServiceProvider {
                     .ok_or_else(|| ProviderError::Execution("Missing required parameter: name".into()))?;
                 let lines = params.get("lines").and_then(|n| n.as_u64()).unwrap_or(50) as usize;
                 
-                // Currently returning stub for journal as it requires sd-journal or process spanning
-                Ok(serde_json::json!({
-                    "unit": name,
-                    "entries": [format!("Journal stub for {} (lines: {})", name, lines)]
-                }))
+                crate::linux::systemd::journal_tail(Some(name), lines)
             }
             _ => Err(ProviderError::NotFound(tool.into())),
         }

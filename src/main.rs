@@ -1,9 +1,9 @@
-pub mod core;
+pub mod engine;
 pub mod linux;
 pub mod providers;
 pub mod transport;
 
-use crate::core::registry::ProviderRegistry;
+use crate::engine::registry::ProviderRegistry;
 use crate::transport::mcp::McpTransport;
 use crate::providers::{
     system::SystemProvider,

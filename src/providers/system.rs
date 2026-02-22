@@ -1,4 +1,4 @@
-use crate::core::provider::{Provider, ProviderError, Result, Tool, ToolType};
+use crate::engine::provider::{Provider, ProviderError, Result, Tool, ToolType};
 use serde_json::Value;
 
 pub struct SystemProvider;

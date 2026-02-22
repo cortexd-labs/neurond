@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
-use crate::core::registry::ProviderRegistry;
+use crate::engine::registry::ProviderRegistry;
 
 /// Standard JSON-RPC 2.0 Error Codes
 #[derive(Debug, Clone, Copy)]
@@ -91,7 +91,8 @@ impl<'a> McpTransport<'a> {
     }
 
     pub fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        let id = req.id.unwrap_or(Value::Null);
+        // Handle notifications (JSON-RPC without an ID)
+        let id = req.id.clone()?;
 
         match req.method.as_str() {
             "initialize" => {
@@ -209,7 +210,7 @@ impl<'a> McpTransport<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::provider::{Provider, Tool, ToolType, ProviderError};
+    use crate::engine::provider::{Provider, Tool, ToolType, ProviderError};
 
     struct TestProvider;
     impl Provider for TestProvider {
@@ -224,7 +225,7 @@ mod tests {
                 }
             ]
         }
-        fn call(&self, tool: &str, params: Value) -> crate::core::provider::Result<Value> {
+        fn call(&self, tool: &str, params: Value) -> crate::engine::provider::Result<Value> {
             if tool == "test.echo" {
                 Ok(params)
             } else {
