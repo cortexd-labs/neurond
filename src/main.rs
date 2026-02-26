@@ -1,35 +1,22 @@
 pub mod config;
-pub mod engine;
 pub mod federation;
-pub mod linux;
-pub mod native;
-pub mod router;
+pub mod upstream;
+pub mod registration;
 
-use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 use tokio::net::TcpListener;
 use axum::Router;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService,
     session::local::LocalSessionManager,
 };
-use crate::engine::server::NeurondEngine;
-use crate::engine::policy::Policy;
-use crate::engine::audit::AuditLogger;
-use crate::native::system::{SystemProvider, LinuxSystemProvider};
 
-/// Default paths for configuration and logging.
-/// In production, these should be overridden by CLI args or environment variables.
-const DEFAULT_POLICY_PATH: &str = "/etc/neurond/policy.toml";
-const DEFAULT_AUDIT_LOG: &str = "/var/log/neurond/audit.log";
-
-/// Fallback paths for development (relative to CWD).
-const DEV_POLICY_PATH: &str = "policy.toml";
-const DEV_AUDIT_LOG: &str = "audit.log";
+use crate::federation::manager::FederationManager;
+use crate::upstream::server::ProxyEngine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Respect RUST_LOG if set, otherwise default to neurond=info
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("neurond=info"));
 
@@ -38,57 +25,61 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("Starting Neurond Linux Controller MCP server");
+    tracing::info!("Starting neurond Federation Proxy");
 
-    // Try production path first, fall back to dev path
-    let policy_path = if std::path::Path::new(DEFAULT_POLICY_PATH).exists() {
-        DEFAULT_POLICY_PATH
+    // Load config
+    let config = config::load_config()?;
+    let bind_addr = format!("{}:{}", config.server.bind, config.server.port);
+
+    // Initialize federation manager and connect to downstreams
+    let federation = Arc::new(FederationManager::new());
+    federation.init_from_config(&config.federation).await?;
+
+    // Log connected downstreams
+    let status = federation.status_summary().await;
+    for (ns, state) in &status {
+        tracing::info!(namespace = %ns, state = %state, "Downstream status");
+    }
+
+    let tools = federation.list_all_tools().await;
+    tracing::info!("Total tools aggregated: {}", tools.len());
+
+    // Start registration/heartbeat if cortexd configured
+    let _heartbeat_shutdown = if let Some(reg) = &config.registration {
+        // Register with cortexd
+        let capabilities: Vec<String> = status.iter().map(|(ns, _)| ns.clone()).collect();
+        let hostname = gethostname().unwrap_or_else(|| "unknown".to_string());
+
+        let payload = registration::register::RegisterPayload {
+            node_id: reg.node_id.clone(),
+            hostname,
+            ip_address: config.server.bind.clone(),
+            port: config.server.port,
+            capabilities,
+        };
+
+        if let Err(e) = registration::register::register_node(&reg.cortexd_url, &payload).await {
+            tracing::warn!(error = %e, "Failed to register with cortexd — continuing without orchestrator");
+        }
+
+        // Start heartbeat
+        Some(registration::heartbeat::spawn_heartbeat(
+            reg.cortexd_url.clone(),
+            reg.node_id.clone(),
+            reg.heartbeat_interval_secs,
+        ))
     } else {
-        DEV_POLICY_PATH
+        tracing::info!("No cortexd registration configured — running standalone");
+        None
     };
 
-    let policy = Policy::load_from_file(policy_path).unwrap_or_else(|err| {
-        tracing::warn!("Failed to load {} ({}). Defaulting to Deny-All.", policy_path, err);
-        Policy::default()
-    });
-    tracing::info!("Loaded policy from {}", policy_path);
-
-    let audit_path = if std::path::Path::new(DEFAULT_AUDIT_LOG)
-        .parent()
-        .is_some_and(|p| p.exists())
-    {
-        DEFAULT_AUDIT_LOG
-    } else {
-        DEV_AUDIT_LOG
-    };
-    let audit_logger = AuditLogger::new(audit_path);
-    tracing::info!("Audit log: {}", audit_path);
-
-    let dbus_conn = Arc::new(zbus::Connection::system().await?);
-    let session_conn = Arc::new(
-        zbus::Connection::session().await
-            .unwrap_or_else(|err| {
-                tracing::warn!("Session D-Bus unavailable ({}). Desktop tools will fail.", err);
-                // We can't easily create a no-op Connection, so we panic in non-headless setups.
-                // In headless/server deployments, disable the desktop provider via policy.
-                panic!("Session D-Bus required. Set DBUS_SESSION_BUS_ADDRESS or disable desktop tools in policy.toml.");
-            })
-    );
-    let policy = Arc::new(policy);
-    let audit_logger = Arc::new(audit_logger);
-    let system_provider: Arc<dyn SystemProvider> = Arc::new(LinuxSystemProvider);
-
+    // Start upstream SSE server
     let session_manager = LocalSessionManager::default();
 
+    let fed = federation.clone();
     let mcp_service = StreamableHttpService::new(
         move || {
-            let engine = NeurondEngine::new(
-                dbus_conn.clone(),
-                session_conn.clone(),
-                policy.clone(),
-                audit_logger.clone(),
-                system_provider.clone()
-            );
+            let engine = ProxyEngine::new(fed.clone());
             Ok(engine)
         },
         session_manager.into(),
@@ -96,9 +87,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let app = Router::new().nest_service("/api/v1/mcp", mcp_service);
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    
-    tracing::info!("Server listening on http://0.0.0.0:8080");
+    let listener = TcpListener::bind(&bind_addr).await?;
+
+    tracing::info!("neurond proxy listening on http://{}", bind_addr);
     axum::serve(listener, app).await?;
+
     Ok(())
+}
+
+/// Get the system hostname.
+fn gethostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
 }

@@ -1,102 +1,87 @@
 # neurond
 
-`neurond` is an AI-native Linux system controller and **local federation proxy**. It exposes ~100 tools across 15 providers — covering system telemetry, process management, services, logs, networking, containers, packages, identity, storage, scheduling, security, time, hardware, and desktop — as a single [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server over HTTP+SSE.
+**MCP Federation Proxy** — aggregates multiple [MCP](https://modelcontextprotocol.io/) servers behind a single endpoint with namespaced tool routing.
 
-AI models like Claude can use `neurond` to observe and manage a live Linux host in real time, with every action governed by a configurable policy and written to a structured audit log. As a federation proxy, neurond also aggregates third-party MCP servers (redis-mcp, postgres-mcp, custom tools) behind a single authenticated endpoint — cortexd connects once per machine.
-
----
-
-## Providers
-
-| Provider | Tools | Description |
-| --- | --- | --- |
-| `system` | 9 | CPU, memory, disk, uptime, load, kernel, reboot, sysctl |
-| `process` | 6 | List, top, tree, inspect, open files, kill, signal, nice |
-| `service` | 9 | Systemd unit list, status, logs, deps, start/stop/restart/enable/disable |
-| `log` | 6 | Journal tail, search, units, stream, rotate, vacuum |
-| `network` | 7 | Interfaces, addresses, routes, connections, ports, DNS, firewall |
-| `file` | 8 | Stat, list, read, tail, search, write, mkdir, chmod |
-| `container` | 9 | Docker list, status, logs, stats, inspect, start/stop/restart/remove |
-| `package` | 7 | dpkg list, upgradable, search, info, install, update, remove |
-| `identity` | 7 | Users, groups, sudoers, SSH key list/add/remove, user lock |
-| `storage` | 6 | Block devices, fstab, LVM, SMART health, mount, unmount |
-| `schedule` | 4 | Cron list, systemd timers, cron add/remove |
-| `security` | 3 | SELinux/AppArmor status, certificate expiry, auditd rules |
-| `time` | 2 | NTP sync status, force sync |
-| `hardware` | 3 | Thermal sensors, PCI devices, USB devices |
-| `desktop` | 12 | Windows, apps, clipboard, MPRIS media, theme, volume, notifications |
+neurond connects to downstream MCP servers (like [mcpd](https://github.com/cortexd-labs/mcpd)), discovers their tools, prefixes them with a namespace, and exposes them upstream as a unified tool registry.
 
 ---
 
 ## Architecture
 
-```text
+```
                     ┌─────────────────────────────────────────────┐
-                    │              Node (Linux host)              │
+                    │                  Host                        │
                     │                                             │
-                    │  ┌─────────────────────────────────────┐    │
-  cortexd ── mTLS ──┤  │             neurond                 │    │
-  (fleet)    :8080  │  │                                     │    │
-                    │  │  ┌───────────┐  ┌────────────────┐  │    │
-                    │  │  │  native/  │  │  federation/   │  │    │
-                    │  │  │           │  │                │  │    │
-                    │  │  │ system.*  │  │ redis.*  ──────┼──┼──→ redis-mcp (stdio)
-                    │  │  │ process.* │  │ pg.*     ──────┼──┼──→ postgres-mcp (127.0.0.1)
-                    │  │  │ service.* │  │ custom.* ──────┼──┼──→ custom-mcp (stdio)
-                    │  │  │ log.*     │  │                │  │
-                    │  │  │ ...       │  └────────────────┘  │
-                    │  │  └───────────┘                      │
-                    │  │  engine/ — policy · audit · server  │
-                    │  └─────────────────────────────────────┘    │
+  cortexd ─────────┤  ┌─────────────────────────────────────┐    │
+  (fleet)   :8443  │  │           neurond                    │    │
+                    │  │                                     │    │
+                    │  │  ┌─────────────┐  ┌──────────────┐  │    │
+                    │  │  │ upstream/   │  │ federation/  │  │    │
+                    │  │  │             │  │              │  │    │
+                    │  │  │ ProxyEngine │  │ manager.rs   │  │    │
+                    │  │  │ (MCP Server)│  │ namespace.rs │  │    │
+                    │  │  │             │  │ transport.rs │  │    │
+                    │  │  └──────┬──────┘  └──────┬───────┘  │    │
+                    │  │         │                 │          │    │
+                    │  │         └─────────────────┘          │    │
+                    │  │                  │                   │    │
+                    │  └──────────────────┼───────────────────┘    │
+                    │                     │                        │
+                    │          ┌──────────┴──────────┐             │
+                    │          ▼                     ▼             │
+                    │  mcpd (localhost:8080)   redis-mcp (stdio)   │
+                    │  namespace: "linux"      namespace: "redis"  │
+                    │  linux.system.info       redis.get           │
+                    │  linux.process.list      redis.set           │
+                    │  linux.service.restart   redis.keys          │
                     └─────────────────────────────────────────────┘
 ```
 
-**Source layout:**
+---
 
-```text
-src/
-├── main.rs              # Entry point, signal handling
-├── config.rs            # neurond.toml parsing (server, audit, federation)
-├── router.rs            # Top-level tool routing: native → engine, namespaced → federation
-│
-├── engine/
-│   ├── server.rs        # NeurondEngine — all 100 tool registrations (#[tool] handlers)
-│   ├── policy.rs        # Deny-by-default TOML policy engine
-│   └── audit.rs         # Structured JSONL audit logger
-│
-├── native/              # One module per Linux provider domain
-│   └── system.rs · process.rs · service.rs · log.rs · network.rs · file.rs
-│       container.rs · package.rs · identity.rs · storage.rs · schedule.rs
-│       security.rs · time.rs · hardware.rs · desktop.rs
-│
-├── linux/               # Low-level OS interface layer
-│   ├── systemd.rs       # D-Bus proxies (systemd, journald)
-│   ├── network.rs       # Netlink (rtnetlink), /proc/net parsing
-│   └── desktop.rs       # D-Bus session bus (MPRIS, notifications)
-│
-└── federation/          # Local Federation Proxy (Phase 3)
-    ├── connection.rs    # DownstreamConnection, DownstreamState machine
-    ├── namespace.rs     # Tool rewriting (redis.get), request routing
-    ├── lifecycle.rs     # Spawn, restart with backoff, healthcheck
-    └── transport.rs     # stdio (TokioChildProcess) + localhost HTTP helpers
-```
+## How It Works
 
-- **`engine/`** — MCP server, deny-by-default policy enforcement, JSONL audit log.
-- **`native/`** — One module per provider domain. Input validation, pure Rust logic, no raw syscalls.
-- **`linux/`** — Low-level OS access: D-Bus proxies (systemd, desktop), Netlink, `/proc` and `/sys` parsing.
-- **`federation/`** — Local Federation Proxy: aggregates downstream MCP servers behind a single endpoint. Stub today, implemented in Phase 3.
-
-Mutation tools (reboot, kill, firewall, package install, etc.) are **denied by default** and must be explicitly allowed in `policy.toml`.
+1. **Config** — `neurond.toml` declares downstream MCP servers with namespace prefixes and transport types
+2. **Connect** — On startup, neurond connects to each downstream and discovers their tools
+3. **Namespace** — Each tool is prefixed: `system.info` from mcpd becomes `linux.system.info`
+4. **Expose** — All namespaced tools are exposed as a single MCP server on `:8443`
+5. **Route** — Incoming `linux.system.info` call → strip prefix → forward `system.info` to mcpd
 
 ---
 
-## Security
+## Configuration
 
-- **Policy engine** — `policy.toml` defines allow/deny rules with glob patterns (`system.*`, `network.firewall.*`). Default action is `deny`.
-- **Audit log** — Every tool call is logged as a JSON line: timestamp, tool, params, decision, result, duration.
-- **Input validation** — All user-controlled strings (unit names, package names, file paths, signal numbers) are validated before use. Shell metacharacter injection is rejected at the validation layer.
-- **Path allowlist** — File operations are restricted to `/var/log`, `/var/lib`, `/etc`, `/tmp`, `/home`, `/opt`, `/srv`, `/usr/share`, `/proc`, `/sys/class`. Sensitive files (`/etc/shadow`, `/etc/gshadow`, `/etc/sudoers`) are always blocked.
-- **Direct syscalls over subprocesses** — Where possible, kernel interfaces are used directly: systemd unit control via D-Bus, sysctl via `/proc/sys`, reboot via `org.freedesktop.login1`.
+```toml
+# neurond.toml
+
+[server]
+bind = "127.0.0.1"   # localhost until TLS is implemented
+port = 8443
+
+# Optional: register with cortexd fleet orchestrator
+# [registration]
+# cortexd_url = "https://cortexd.example.com:9443"
+# heartbeat_interval_secs = 30
+
+# Downstream MCP servers
+[[federation.servers]]
+namespace = "linux"
+transport = "localhost"
+url = "http://127.0.0.1:8080/api/v1/mcp"
+
+[[federation.servers]]
+namespace = "redis"
+transport = "stdio"
+command = "/usr/local/bin/redis-mcp"
+args = ["--mode", "stdio"]
+```
+
+### Transport Types
+
+| Transport   | Description                                         | Use Case                  |
+| ----------- | --------------------------------------------------- | ------------------------- |
+| `localhost` | Connect via HTTP to a running MCP server            | mcpd, any HTTP MCP server |
+| `stdio`     | Spawn a child process, communicate via stdin/stdout | Single-binary MCP tools   |
 
 ---
 
@@ -104,117 +89,78 @@ Mutation tools (reboot, kill, firewall, package install, etc.) are **denied by d
 
 ### Prerequisites
 
-- Linux with systemd (Debian 12 / Ubuntu 22.04+ recommended)
-- Rust 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- D-Bus system socket (standard on any systemd host)
-- For desktop tools: D-Bus session socket, `wmctrl`, `pactl`, `gsettings`
-- For container tools: Docker daemon running
+- Linux (Debian 12 / Ubuntu 22.04+)
+- Rust 1.75+
+- At least one downstream MCP server (e.g., [mcpd](https://github.com/cortexd-labs/mcpd))
 
-### Build
+### Build & Run
 
 ```bash
 git clone https://github.com/cortexd-labs/neurond.git
 cd neurond
 cargo build --release
-```
 
-### Run
+# Create config
+cp neurond.toml.example neurond.toml
+# Edit neurond.toml to point at your downstream(s)
 
-```bash
-# Development (uses ./policy.toml and ./audit.log)
+# Run (development)
 cargo run
 
-# Production (uses /etc/neurond/policy.toml and /var/log/neurond/audit.log)
-sudo ./target/release/neurond
+# Run (production)
+./target/release/neurond
 ```
 
-The server listens on `http://0.0.0.0:8080/api/v1/mcp`.
-
-Log level is controlled by `RUST_LOG` (default: `neurond=info`).
-
-### Configure Policy
-
-Copy and edit the included `policy.toml`:
-
-```toml
-default_action = "deny"
-
-# Allow all read-only system tools
-[[rules]]
-id = "allow-observability"
-effect = "allow"
-tools = ["system.*", "process.*", "service.list", "service.status", "service.logs"]
-
-# Explicitly allow a mutation tool
-[[rules]]
-id = "allow-service-restart"
-effect = "allow"
-tools = ["service.restart"]
-```
-
-Rules are evaluated with **deny-wins** semantics: if any matching rule is `deny`, the tool is blocked regardless of other rules.
+Server listens on `http://127.0.0.1:8443/api/v1/mcp`.
 
 ---
 
-## Testing with Claude Desktop
+## Testing
 
-1. Build the release binary: `cargo build --release`
-2. Add to `~/.config/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "neurond": {
-      "type": "http",
-      "url": "http://localhost:8080/api/v1/mcp"
-    }
-  }
-}
+```bash
+cargo test          # 14 tests
+cargo clippy -- -W clippy::all
 ```
 
-3. Start `neurond`, then restart Claude Desktop.
-
----
-
-## Testing with the MCP Inspector
+Test with the MCP Inspector:
 
 ```bash
 npx -y @modelcontextprotocol/inspector
+# Transport: HTTP+SSE, URL: http://localhost:8443/api/v1/mcp
 ```
-
-Set transport to **HTTP+SSE**, URL to `http://localhost:8080/api/v1/mcp`, then call any tool interactively.
 
 ---
 
-## Development
+## Project Structure
 
-```bash
-# Run all tests
-cargo test
-
-# Strict lint (CI requirement — zero warnings)
-cargo clippy -- -D warnings
-
-# Run a specific provider's tests
-cargo test native::process
 ```
-
-Tests are written alongside every provider. Mutation tools are tested by validating rejection of malformed input (injection strings, out-of-range values) without requiring root or a live system.
+src/
+├── main.rs                # Entry point, config loading, server startup
+├── config.rs              # neurond.toml parsing
+│
+├── federation/
+│   ├── manager.rs         # Downstream orchestration, tool aggregation, call routing
+│   ├── connection.rs      # Downstream lifecycle state machine
+│   ├── namespace.rs       # Tool name prefixing/stripping/resolution
+│   └── transport.rs       # Localhost (HTTP) and stdio (child process) transports
+│
+├── upstream/
+│   └── server.rs          # ProxyEngine — MCP ServerHandler exposed to cortexd
+│
+└── registration/
+    ├── register.rs        # cortexd registration/deregistration
+    └── heartbeat.rs       # Background heartbeat task
+```
 
 ---
 
-## Contributing
+## Related Projects
 
-1. Add new tools under `src/native/` with a matching `#[cfg(test)]` block.
-2. If the tool requires raw OS access, add the low-level function to `src/linux/`.
-3. Register the tool in `src/engine/server.rs` following the existing `#[tool]` pattern.
-4. Add a `policy.toml` rule (read tools to the allow group, mutation tools left denied with a comment).
-5. Ensure `cargo build && cargo clippy -- -D warnings && cargo test` all pass.
-
-See [`tasks/todo.md`](tasks/todo.md) for the improvement backlog and federation roadmap.
+- **[mcpd](https://github.com/cortexd-labs/mcpd)** — Linux MCP server exposing 100+ system tools (the primary downstream for neurond)
+- **cortexd** — Fleet orchestrator for managing multiple neurond nodes (planned)
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
