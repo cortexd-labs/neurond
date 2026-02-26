@@ -8,12 +8,12 @@ neurond connects to downstream MCP servers (like [mcpd](https://github.com/corte
 
 ## Architecture
 
-```
+```text
                     ┌─────────────────────────────────────────────┐
-                    │                  Host                        │
+                    │                  Host                       │
                     │                                             │
-  cortexd ─────────┤  ┌─────────────────────────────────────┐    │
-  (fleet)   :8443  │  │           neurond                    │    │
+  cortexd ──────────┤  ┌─────────────────────────────────────┐    │
+  (fleet)   :8443   │  │           neurond                   │    │
                     │  │                                     │    │
                     │  │  ┌─────────────┐  ┌──────────────┐  │    │
                     │  │  │ upstream/   │  │ federation/  │  │    │
@@ -133,7 +133,7 @@ npx -y @modelcontextprotocol/inspector
 
 ## Project Structure
 
-```
+```text
 src/
 ├── main.rs                # Entry point, config loading, server startup
 ├── config.rs              # neurond.toml parsing
