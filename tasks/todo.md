@@ -4,13 +4,11 @@ Derived from senior tech lead review (2026-02-26).
 neurond is the federation proxy that aggregates tools from downstream MCP servers
 (e.g., mcpd) and exposes them upstream to cortexd.
 
-Priority scale: **P1** = security/correctness bug · **P2** = reliability/maintainability · **P3** = Rust idioms · **P4** = testing gaps
+Priority scale: **P1** = security/correctness · **P2** = reliability/maintainability · **P3** = code quality · **P4** = testing gaps
 
 ---
 
 ## P1 — Security & Correctness
-
----
 
 ### [ ] FIX: Default bind `127.0.0.1` — implement TLS before opening to network
 
@@ -22,8 +20,6 @@ Priority scale: **P1** = security/correctness bug · **P2** = reliability/mainta
 neurond is designed to listen on `:8443` for cortexd over mTLS, but there is zero TLS implementation. Opening to the network without TLS allows unauthenticated remote tool invocation.
 
 **Fix:**
-Implement TLS using `axum-server` + `rustls`:
-
 1. Add `tls` section to `neurond.toml` (cert_path, key_path, ca_path)
 2. Use `axum_server::bind_rustls()` when TLS config is present
 3. Validate certs at startup, fail-fast on invalid certs
@@ -31,27 +27,35 @@ Implement TLS using `axum-server` + `rustls`:
 
 ---
 
-### [x] DONE: `node_id` regenerated on every startup
-
-**Category:** Security / Correctness
-**File:** `src/config.rs:97`
-**Status:** Fixed 2026-02-26
-
----
-
-### [x] DONE: Audit log failure must not silently allow mutations
+### [ ] IMPLEMENT: Mutual TLS (mTLS) with Certificate Pinning
 
 **Category:** Security
-**Files:** `src/security/audit.rs`, `src/upstream/server.rs`
-**Status:** Fixed 2026-02-26
+
+**Description:** Enforce mTLS for the cortexd uplink using statically compiled `rustls`. Implement certificate pinning to reject rogue Root CAs injected into the host OS. Implement automated CSR generation and background rotation of short-lived ephemeral certificates.
 
 ---
 
-### [x] DONE: Policy engine — deny-wins semantics
+### [ ] IMPLEMENT: Privilege Dropping
+
+**Category:** Security
+
+**Description:** Integrate the `privdrop` crate (Linux) and `deelevate` crate (Windows). Perform an irreversible privilege drop to the unprivileged `neurond` user immediately after privileged bootstrapping (e.g., binding protected ports, reading certificates).
+
+---
+
+### [ ] IMPLEMENT: Write-Ahead Logging (WAL) for Audit Trail
 
 **Category:** Security / Correctness
-**File:** `src/security/policy.rs`
-**Status:** Fixed 2026-02-26
+
+**Description:** Integrate `okaywal` to batch and `fsync` JSONL audit logs to disk. Return control only after physical commitment to guarantee durability against OOM kill or power loss.
+
+---
+
+### [ ] FIX: Stdio `stderr` Isolation
+
+**Category:** Correctness
+
+**Problem:** `stderr` from downstream stdio child processes must be strictly redirected to the diagnostic logger. If it bleeds into `stdout` it corrupts the JSON-RPC stream and causes protocol desynchronization.
 
 ---
 
@@ -62,14 +66,11 @@ Implement TLS using `axum-server` + `rustls`:
 
 **Problem:**
 `axum::serve().await` blocks until killed. On SIGTERM:
-
 - `deregister_node()` exists but is never called
 - Heartbeat `watch::Sender` dropped without flush
 - Downstream connections not drained
 
 **Fix:**
-Add signal handler:
-
 ```rust
 tokio::spawn(async move {
     tokio::signal::ctrl_c().await.ok();
@@ -87,17 +88,9 @@ axum::serve(listener, app)
 **Category:** Security / Correctness
 **File:** `src/config.rs`
 
-**Problem:**
-No validation after parsing:
-
-- `namespace` could be empty or contain dots (breaks routing)
-- `url` in Localhost variant could be malformed
-- `command` in Stdio variant could be relative (PATH injection)
-- Duplicate namespaces silently route to first match
+**Problem:** No validation after parsing — `namespace` could be empty or contain dots, `url` in Localhost variant could be malformed, `command` in Stdio variant could be relative (PATH injection), duplicate namespaces silently route to first match.
 
 **Fix:**
-Add `Config::validate(&self) -> anyhow::Result<()>`:
-
 ```rust
 fn validate(&self) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
@@ -120,15 +113,41 @@ fn validate(&self) -> anyhow::Result<()> {
 
 ---
 
-### [x] DONE: Extend wildcard matching to full glob patterns
+### [ ] IMPLEMENT: Policy-Based Tool Filtering (`list_tools`)
 
-**Category:** Usability
-**File:** `src/security/policy.rs`
-**Status:** Fixed 2026-02-26
+**Category:** Security
+
+**Problem:** `tools/list` returns all aggregated tools from downstreams regardless of policy. The model can see and attempt to call tools it is not authorized to use, causing hallucinations and policy bypass.
+
+**Fix:** Filter the aggregated tool list through the policy engine before returning to upstream. Only expose tools that would pass an `Allow` check. Also needed: log filtered-out tools in the audit trail.
+
+---
+
+### [ ] ENHANCE: Audit Log Schema for Delegated Identity and Duration
+
+**Category:** Security / Auditing
+
+**Description:** Update the JSONL `audit.log` schema to capture `duration_ms` for each tool execution and `obo_identity` when On-Behalf-Of JWT tokens are forwarded from the Agentgateway control plane.
+
+---
+
+### [x] DONE: `node_id` regenerated on every startup — Fixed 2026-02-26
+
+### [x] DONE: Audit log failure must not silently allow mutations — Fixed 2026-02-26
+
+### [x] DONE: Policy engine — deny-wins semantics — Fixed 2026-02-26
+
+### [x] DONE: Extend wildcard matching to full glob patterns — Fixed 2026-02-26
 
 ---
 
 ## P2 — Reliability & Robustness
+
+### [ ] IMPLEMENT: HTTP Transport Middleware Stack
+
+**Category:** Reliability
+
+**Description:** Layer `tower` middleware onto the `axum` HTTP transport to enforce rate limiting, connection timeouts, request tracing, and payload size limits before JSON-RPC messages reach the execution engine.
 
 ---
 
@@ -137,16 +156,12 @@ fn validate(&self) -> anyhow::Result<()> {
 **Category:** Reliability
 **File:** `src/federation/manager.rs:98-148`
 
-**Problem:**
-Read guard held while `client.peer().call_tool().await` executes. Slow downstream (30s timeout) blocks all other calls because `add_downstream` needs a write guard.
+**Problem:** Read guard held while `client.peer().call_tool().await` executes. A slow downstream (30s timeout) blocks all other calls because `add_downstream` needs a write guard.
 
-**Fix:**
-Clone client handle, drop lock before network call:
-
+**Fix:** Clone client handle before the await, then drop the lock:
 ```rust
 let client = {
     let downstreams = self.downstreams.read().await;
-    // ... resolve, find conn ...
     conn.client.clone()
     // lock dropped here
 };
@@ -160,16 +175,9 @@ client.peer().call_tool(params).await
 **Category:** Reliability
 **Files:** `src/federation/connection.rs`, `src/federation/manager.rs`
 
-**Problem:**
-`MAX_RETRIES` defined but never used. `mark_restarting()` exists but never called. Dead downstream stays `Healthy` with dead client.
+**Problem:** `MAX_RETRIES` defined but never used. `mark_restarting()` exists but never called. Dead downstream stays `Healthy` with a dead client.
 
-**Fix:**
-Implement background health check loop:
-
-1. Spawn `tokio::spawn` per downstream
-2. Periodic `client.peer().ping()` (or list_tools)
-3. On failure: `mark_restarting()` → retry connect → `mark_healthy()` or `mark_failed()`
-4. Respect `MAX_RETRIES` and `healthcheck_interval_secs` from config
+**Fix:** Spawn a background health check per downstream: periodic `client.peer().ping()`, on failure `mark_restarting()` → retry → `mark_healthy()` or `mark_failed()`.
 
 ---
 
@@ -178,11 +186,7 @@ Implement background health check loop:
 **Category:** Performance
 **File:** `src/registration/register.rs`
 
-**Problem:**
-Two separate `reqwest::Client::new()` calls (register + deregister). Client maintains connection pool; reusing saves FDs.
-
-**Fix:**
-Pass shared `reqwest::Client` from `main.rs` or use `once_cell::sync::Lazy`.
+**Fix:** Pass a shared `reqwest::Client` from `main.rs` or use `once_cell::sync::Lazy` to preserve the connection pool across register/deregister calls.
 
 ---
 
@@ -191,57 +195,43 @@ Pass shared `reqwest::Client` from `main.rs` or use `once_cell::sync::Lazy`.
 **Category:** Performance
 **File:** `src/federation/manager.rs:80-87`
 
-**Problem:**
-`.flat_map(|c| c.tools.clone())` allocates full clone on every `list_tools` request.
-
-**Fix:**
-Cache in `Arc<Vec<Tool>>`, rebuild only when downstreams change. list_tools becomes `Arc::clone()`.
+**Fix:** Cache in `Arc<Vec<Tool>>`, rebuild only when downstreams change. `list_tools` becomes `Arc::clone()` — no allocation per request.
 
 ---
 
-## P3 — Rust Idioms & Code Quality
+### [ ] ADD: One-Line Installation Script
+
+**Category:** Deployment
+
+**Description:** Create `install.sh` that fetches, verifies (checksum + GPG), and installs standalone `neurond` and `mcpd` binaries, then registers and starts the systemd units.
 
 ---
 
-### [x] DONE: Added `Default` impl for `FederationManager`
+### [ ] DOCS: Secure Reverse Proxy Configuration Guide
 
-**Status:** Fixed 2026-02-26
+**Category:** Documentation
 
----
-
-### [x] DONE: `sort_by` → `sort_by_key(Reverse)`
-
-**Status:** Fixed 2026-02-26
+**Description:** Document strict configuration for deploying `neurond` behind reverse proxies or Agentgateway. Explicitly warn against `proxy_set_header Host $host` which enables localhost spoofing and auth bypass.
 
 ---
 
-### [x] DONE: Format string variables (`{var}` syntax)
+## P3 — Code Quality
 
-**Status:** Fixed 2026-02-26
+### [x] DONE: Added `Default` impl for `FederationManager` — Fixed 2026-02-26
 
----
+### [x] DONE: `sort_by` → `sort_by_key(Reverse)` — Fixed 2026-02-26
 
-### [x] DONE: Removed unused `use tracing;`
+### [x] DONE: Format string variables (`{var}` syntax) — Fixed 2026-02-26
 
-**Status:** Fixed 2026-02-26
+### [x] DONE: Removed unused `use tracing;` — Fixed 2026-02-26
 
----
+### [x] DONE: Suppressed `manual_async_fn` on `ServerHandler` impl — Fixed 2026-02-26
 
-### [x] DONE: Suppressed `manual_async_fn` on `ServerHandler` impl
+### [x] DONE: Removed unused deps (`dashmap`, `schemars`, `tokio-stream`) — Fixed 2026-02-26
 
-**Status:** Fixed 2026-02-26
-
----
-
-### [x] DONE: Removed unused deps (`dashmap`, `schemars`, `tokio-stream`)
-
-**Status:** Fixed 2026-02-26
+### [x] DONE: Default bind changed `0.0.0.0` → `127.0.0.1` — Fixed 2026-02-26
 
 ---
-
-### [x] DONE: Default bind changed `0.0.0.0` → `127.0.0.1`
-
-**Status:** Fixed 2026-02-26
 
 ### [ ] CLEANUP: `Effect` should derive `Copy`
 
@@ -251,165 +241,144 @@ Cache in `Arc<Vec<Tool>>`, rebuild only when downstreams change. list_tools beco
 
 ### [ ] CLEANUP: `DownstreamConnection` fields should be `pub(crate)` or private
 
-**Category:** Encapsulation
 **File:** `src/federation/connection.rs`
 
-**Problem:**
-All fields are `pub`, bypassing the state machine methods.
-
-**Fix:**
-Make fields `pub(crate)` or private with getters.
+**Problem:** All fields are `pub`, bypassing the state machine methods.
 
 ---
 
 ### [ ] CLEANUP: `gethostname()` should use syscall, not read `/etc/hostname`
 
-**Category:** Linux best practice
 **File:** `src/main.rs:99-103`
 
-**Problem:**
-Reading `/etc/hostname` may return stale value if hostname changed at runtime.
-
-**Fix:**
-Use `nix::unistd::gethostname()` or add `hostname = "0.3"` crate.
+**Problem:** `/etc/hostname` may be stale if hostname changed at runtime. Use `nix::unistd::gethostname()` or the `hostname` crate instead.
 
 ---
 
 ## P4 — Testing Gaps
 
----
-
 ### [ ] ADD: Tests for `connection.rs` state machine
 
-**Category:** Testing
-**File:** `src/federation/connection.rs` — **0 tests**
+`src/federation/connection.rs` — **0 tests**
 
-**Tests needed:**
-
-- `Configured → Starting → Healthy` transition
-- `Healthy → Restarting → Failed` transition
-- `mark_restarting()` increments attempt counter
-- `mark_failed()` clears tools and client
-- `is_healthy()` requires both `Healthy` state and `client.is_some()`
+Needed: `Configured → Starting → Healthy` transition, `Healthy → Restarting → Failed` transition, `mark_restarting()` increments attempt counter, `mark_failed()` clears tools and client, `is_healthy()` requires both `Healthy` state and `client.is_some()`.
 
 ---
 
 ### [ ] ADD: Tests for `config.rs` parsing
 
-**Category:** Testing
-**File:** `src/config.rs` — **0 tests**
+`src/config.rs` — **0 tests**
 
-**Tests needed:**
-
-- Parse valid `neurond.toml` with all sections
-- Parse minimal config (defaults applied correctly)
-- Missing required fields → error
-- Invalid transport type → error
-- Default bind is `127.0.0.1`, default port is `8443`
+Needed: valid `neurond.toml` round-trip, minimal config defaults, missing required fields → error, invalid transport type → error, default bind is `127.0.0.1` and port is `8443`.
 
 ---
 
 ### [ ] ADD: Integration test for transport layer
 
-**Category:** Testing
-**File:** `src/federation/transport.rs` — **0 tests**
+`src/federation/transport.rs` — **0 tests**
 
-**Tests needed:**
-
-- Integration test: spin up in-process MCP server → connect via localhost → list_tools
-- Stdio transport: spawn a simple echo MCP server → verify connection
-- Invalid URL → meaningful error
+Needed: spin up in-process MCP server → connect via localhost → list_tools, stdio transport with echo server, invalid URL → meaningful error.
 
 ---
 
 ### [ ] IMPROVE: `manager.rs` tests with mock downstreams
 
-**Category:** Testing
 **File:** `src/federation/manager.rs`
 
-**Problem:**
-Only empty-state tests exist. No tests with actual connected downstreams.
+**Problem:** Only empty-state tests exist. Create a mock `ServerHandler` → connect manager → test routing and tool aggregation.
 
-**Fix:**
-Create a mock MCP server using rmcp's `ServerHandler` trait → connect manager → test routing.
+---
+
+### [ ] ADD: End-to-End Integration Tests
+
+Create `tests/integration/` validating real process execution:
+
+1. **`test_stdio_discovery.rs`** — neurond spawns `mcpd` over stdio, handshakes `initialize`, retrieves tools, exposes them prefixed with namespace. Shutdown sends SIGTERM to child, no zombies.
+2. **`test_strict_policy_routing.rs`** — strict policy allows `network.ping`, denies `system.*`. Verify allowed calls reach downstream, denied calls return `INVALID_REQUEST` without touching downstream, both logged to `audit.log`.
+3. **`test_multi_downstream_isolation.rs`** — 3 downstreams (2 stdio, 1 localhost). `list_tools` aggregates all. Tool call to downstream A does not touch downstream C.
+4. **`test_downstream_network_failures.rs`** — downstream is a tarpit. Tool call times out after 30s without holding the `RwLock`. Concurrent calls to other downstreams remain responsive.
 
 ---
 
 ## Architecture — Future Work
 
----
-
 ### [ ] DESIGN: Shared types crate (`neurond-protocol` or `mcp-types`)
 
-**Problem:**
-`RegisterPayload`, namespace conventions, API paths defined independently across neurond, mcpd, and eventually cortexd.
+**Problem:** `RegisterPayload`, namespace conventions, and API paths are defined independently across neurond, mcpd, and cortexd.
 
-**Fix:**
-Extract shared crate with registration payloads, heartbeat payloads, status enums, API path constants.
+**Fix:** Extract a shared crate with registration payloads, heartbeat payloads, status enums, and API path constants.
 
 ---
 
-## Linux Best Practices
+## Linux Deployment
+
+### [ ] ADD: systemd service file (`neurond.service`) with sandboxing
+
+```ini
+[Service]
+Type=simple
+User=neurond
+Restart=on-failure
+After=network-online.target mcpd.service
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/log/neurond /etc/neurond
+```
 
 ---
 
-### [ ] ADD: systemd service file `neurond.service`
+### [ ] ADD: Native OS Packaging
 
-- `Type=simple`
-- `User=neurond` (non-root service account)
-- `Restart=on-failure`
-- `ProtectSystem=strict`, `ProtectHome=yes`
-- `After=network-online.target mcpd.service`
+Use `cargo-deb` and `cargo-rpm` / `rust2rpm`. Include `postinst` / `%post` scripts to provision the `neurond:neurond` system user and restrict `/var/log/neurond` ownership.
 
 ---
 
-### [ ] ADD: Sample config file `neurond.toml.example`
+### [ ] ADD: Append-Only Audit Log (`chattr +a`)
 
-Create a well-documented example config showing:
+Apply `chattr +a` to `/var/log/neurond/audit.log` post-install. Add `prerotate`/`postrotate` hooks to `logrotate` to temporarily lift the attribute during compression.
 
-- Server bind/port
-- mcpd downstream (localhost transport)
-- Optional cortexd registration
-- Stdio transport example
+---
+
+### [ ] ADD: MAC Profiles (SELinux / AppArmor)
+
+- **RHEL:** SELinux policy permitting `neurond_t` context to send D-Bus messages to `init_t`.
+- **Ubuntu:** AppArmor profile confining filesystem access to `/proc/sys`, `/var/log/*` and limiting executable paths for downstream sub-agents.
+
+---
+
+### [ ] ADD: Sample config (`neurond.toml.example`)
+
+Document all fields: bind/port, mcpd downstream (localhost transport), cortexd registration, stdio transport example with absolute binary path.
 
 ---
 
 ### [ ] ADD: PID file or systemd socket activation support
 
-For production daemon management.
+---
+
+## Windows Deployment
+
+### [ ] ADD: Windows SCM Integration
+
+Integrate the `windows-service` crate using `define_windows_service!` to register the service entry point and correctly delegate Start/Stop SCM signals to the async runtime.
 
 ---
 
-## End-to-End Integration Tests
+### [ ] ADD: Windows Process Tree Management via Job Objects
+
+Assign downstream subprocess handles to Job Objects with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` to prevent orphaned sub-agents on abrupt SCM termination.
 
 ---
 
-### [ ] ADD: End-to-End Integration Tests for neurond
+### [ ] ADD: Windows Win32 Pipe Management
 
-**Problem:**
-Right now, `neurond` and `mcpd` are completely decoupled. We lack tests validating that `neurond` correctly manages the lifecycle of a downstream proxy, prefixes namespaces appropriately, enforces policy at the router edge, and handles timeouts/panics safely over IPC or Network layers.
+Use `CreatePipe` for process I/O redirection. Call `SetHandleInformation` to remove the inheritance flag from parent-side pipe ends to prevent handle leaks.
 
-**Fix:**
-Create a dedicated `tests/integration/` suite validating standard workflows under real process execution.
+---
 
-**Specific Test Scenarios to Implement:**
+### [ ] ADD: NTFS ACLs for Append-Only Auditing
 
-1. **Stdio Lifecycle & Discovery (`test_stdio_discovery.rs`)**
-   - **Setup:** Configure neurond to spawn `mcpd` across the `stdio` transport using `cargo run --bin mcpd`.
-   - **Verify:** neurond successfully handshakes `initialize` with the child process, retrieves its tools, and correctly exposes them upstream prefixed with the `namespace` defined in `neurond.toml`.
-   - **Teardown:** Verify that shutting down neurond safely sends a SIGTERM to the `mcpd` child process, avoiding orphaned zombied processes.
-
-2. **Policy Enforcement Edge Context (`test_strict_policy_routing.rs`)**
-   - **Setup:** Spin up neurond with a mock HTTP downstream and a strict `/etc/neurond/policy.toml` that denies `system.*` but allows `network.ping`.
-   - **Verify:** Make a tool call upstream for `network.ping` and assert the downstream actually received the request.
-   - **Verify:** Make a tool call upstream for `system.reboot` and assert it is instantly rejected with `INVALID_REQUEST` without any traffic reaching the downstream MCP.
-   - **Verify:** Assert that both the ALLOWED and DENIED requests were successfully flushed to the `audit.log` file.
-
-3. **Multi-Tenant Federation Integrity (`test_multi_downstream_isolation.rs`)**
-   - **Setup:** Configure neurond with 3 different downstreams: Two `stdio` transports pointing to dummy MCP servers, and one `localhost` HTTP downstream.
-   - **Verify:** `list_tools` across neurond successfully aggregates tools from all 3 downstreams linearly.
-   - **Verify:** Issuing a tool call to downstream "A" does not accidentally execute or leak data to downstream "C".
-
-4. **Network Resilience & Timeouts (`test_downstream_network_failures.rs`)**
-   - **Setup:** Connect neurond to an HTTP downstream that accepts connections but sleeps infinitely (mock tarpit).
-   - **Verify:** Firing a tool call to the tarpit downstream gracefully times out after 30 seconds rather than locking the `RwLock` federation manager permanently. Other concurrent tool calls should remain responsive.
+Use `icacls` to grant the service account only `FILE_APPEND_DATA` on the audit log, explicitly denying `FILE_WRITE_DATA` and `DELETE`.
